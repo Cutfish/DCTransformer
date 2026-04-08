@@ -19,3 +19,5 @@ To experiment with saved model checkpoints, run the following command. Download 
 ```
 CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 main.py --mode 0 --nEpochs 200
 ```
+
+test
