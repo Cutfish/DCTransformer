@@ -1086,15 +1086,15 @@ class DCT(nn.Module):
         upscale_factor (int): 超分辨率倍率 l，如 8
         n_feats (int): 特征通道数 C，默认 180
     """
-    def __init__(self, n_colors, upscale_factor, n_feats=180):
+    def __init__(self, n_colors = 31, upscale_factor = 8, n_feats=180):
         super(DCT, self).__init__()
         kernel_size = 3
         self.up_factor = upscale_factor
 
-        # [公式(4)] HSI 浅层特征提取: LR-HSI → 上采样 → Conv → F_X⁰ [B, C, W, H]
+        # [公式(4)] HSI 浅层特征提取: LR-HSI → 上采样 → Conv → F_X⁰ [B, C = 180, W, H]
         self.headX = nn.Conv2d(n_colors, n_feats, kernel_size, stride=1, padding=3 // 2)
 
-        # [公式(5)] MSI 浅层特征提取: HR-MSI → 两层Conv(Relu中间) → F_Y [B, C, W, H]
+        # [公式(5)] MSI 浅层特征提取: HR-MSI → 两层Conv(Relu中间) → F_Y [B, C = 180, W, H]
         self.headY = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size, stride=1, padding=3 // 2),
             nn.ReLU(),
@@ -1119,11 +1119,11 @@ class DCT(nn.Module):
         """[论文完整前向传播]
 
         Args:
-            x (Tensor): [B, S, w, h] - LR-HSI 输入 Z (低空间分辨率、高光谱)
-            y (Tensor): [B, s, W, H] - HR-MSI 输入 Y (高空间分辨率、低光谱，通常s=3 RGB)
+            x (Tensor): [B, S = 31, w, h] - LR-HSI 输入 Z (低空间分辨率、高光谱)
+            y (Tensor): [B, s = 3, W, H] - HR-MSI 输入 Y (高空间分辨率、低光谱，通常s=3 RGB)
 
         Returns:
-            x_out (Tensor): [B, S, W, H] - 预测的 HR-HSI X̂ (同时具有高空间和高光谱分辨率)
+            x_out (Tensor): [B, S = 31, W, H] - 预测的 HR-HSI X̂ (同时具有高空间和高光谱分辨率)
         """
         x = torch.nn.functional.interpolate(x, scale_factor=self.up_factor, mode='bicubic', align_corners=False)
         x = self.headX(x)

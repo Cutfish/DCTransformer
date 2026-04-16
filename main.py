@@ -88,7 +88,7 @@ else:
     device = 'cuda:0'
 
 # [论文公式] 创建 DCTransformer 模型: DCT(n_colors=S, upscale_factor=l)
-model = DCT(opt.ChDim, opt.upscale_factor).to(device)  # ChDim=31(Chikusei), upscale_factor=8
+model = DCT(opt.ChDim, opt.upscale_factor).to(device)  # ChDim=31(光谱数), upscale_factor=8
 
 if use_dist:
     model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True, device_ids=[local_rank], output_device=local_rank)
