@@ -1116,34 +1116,46 @@ class DCT(nn.Module):
         self.final = nn.Conv2d(n_feats, n_colors, kernel_size, stride=1, padding=3 // 2)
 
     def forward(self, x, y):
-        """[论文完整前向传播]
-
-        Args:
-            x (Tensor): [B, S = 31, w, h] - LR-HSI 输入 Z (低空间分辨率、高光谱)
-            y (Tensor): [B, s = 3, W, H] - HR-MSI 输入 Y (高空间分辨率、低光谱，通常s=3 RGB)
-
-        Returns:
-            x_out (Tensor): [B, S = 31, W, H] - 预测的 HR-HSI X̂ (同时具有高空间和高光谱分辨率)
-        """
+        """[论文完整前向传播] 公式(3)~(7)"""
+        # [公式③] 双三次上采样: LR-HSI [B,31,w,h] → [B,31,8w,8h], 空间对齐到 MSI 尺寸
         x = torch.nn.functional.interpolate(x, scale_factor=self.up_factor, mode='bicubic', align_corners=False)
+        # [公式④] HSI浅层特征提取: Conv(31→180), W/H不变 → x:[B,180,8w,8h]
         x = self.headX(x)
+        # 保存全局残差 F_X⁰ [B,180,8w,8h], 供最终跳跃连接 (公式⑦ res + F_X^K)
         res = x
+        # [公式⑤] MSI浅层特征提取: HR-MSI [B,3,W,H] → Conv(3→64)→ReLU→Conv(64→180) → y:[B,180,W,H]
+        # 注: y 在后续所有 body() 调用中作为引导信号传入, 形状不再改变
         y = self.headY(y)
 
+        # ── 第1级 RDCTG (Residual Dense Cross Transformer Group) ──
+        # dualTransformer 内部: patch_embed → N层DualCrossTransformerBlock(RSTB) → norm → patch_unembed → conv + 残差
+        # 输入x[B,180,8w,8h]与引导y[B,180,W,H]做交叉注意力融合 → x:[B,180,8w,8h]
         x = self.body(x,y)
+        # 密集连接: cat(res[B,180],x[B,180]) 沿通道维拼接 → [B,360,8w,8h]
         x1 = torch.cat((res,x), 1)
+        # 通道压缩: Conv(360→180) 融合密集特征 → x1:[B,180,8w,8h], 作为第2级输入
+
         x1 = self.fe_conv1(x1)
 
+        # ── 第2级 RDCTG ──
+        # 输入x1[B,180,8w,8h]已包含第1级信息, 再次与y[B,180,W,H]交叉注意力融合 → x2:[B,180,8w,8h]
         x2 = self.body(x1,y)
+        # 密集连接: cat(res[B,180],x1[B,180],x2[B,180]) 三级特征拼接 → [B,540,8w,8h]
         x2 = torch.cat((res,x1, x2), 1)
+        # 通道压缩: Conv(540→180) → x2:[B,180,8w,8h], 作为第3级输入
         x2 = self.fe_conv2(x2)
 
+        # ── 第3级 RDCTG (最终级联) ──
+        # 输入x2[B,180,8w,8h]包含前两级密集信息, 最终融合 → x3:[B,180,8w,8h]
         x3 = self.body(x2,y)
+        # 密集连接: cat(res[B,180],x1[B,180],x2[B,180],x3[B,180]) 全部四级特征 → [B,720,8w,8h]
         x3= torch.cat((res,x1, x2, x3), 1)
+        # 通道压缩: Conv(720→180) → x3:[B,180,8w,8h], 即最终的深度特征 F_X^K
         x3 = self.fe_conv3(x3)
 
+        # [公式⑦ 前半部分] 全局残差相加: res[B,180]+x3[B,180] → [B,180,8w,8h]
         x_out = res + x3
+        # [公式⑦ 后半部分] 重建卷积: [B,180,8w,8h] → Conv(180→31) 映射回光谱波段数 → ★ X̂:[B,31,8w,8h]
         x_out = self.final(x_out)
-
 
         return x_out
