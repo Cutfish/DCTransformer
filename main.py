@@ -44,7 +44,7 @@ parser.add_argument('--save_folder', default='TrainedNet/', help='Directory to k
 parser.add_argument('--outputpath', type=str, default='result/', help='Path to output img')
 parser.add_argument('--mode', default=1, type=int, help='Train(1) or Test(其他).')
 parser.add_argument('--local_rank', default=1, type=int, help='None')
-parser.add_argument('--use_distribute', type=int, default=1, help='是否使用分布式训练DDP: 1=是 0=否')
+parser.add_argument('--use_distribute', type=int, default=0, help='是否使用分布式训练DDP: 1=是 0=否')
 opt = parser.parse_args()
 
 print(opt)
