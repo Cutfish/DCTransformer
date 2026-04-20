@@ -760,11 +760,23 @@ class BasicLayer(nn.Module):
             self.downsample = None
 
     def forward(self, x, y, x_size):
+        """[公式(9)] BasicLayer 前向: N=6 个 DCATB 串联
+
+        输入:  x[B, L, C=180], y[B, L, C=180] (MSI引导信号, 在整个循环中不变), x_size=(H,W)
+        输出: [B, L, C=180]
+
+        流程:
+        for i in range(6):                    # depth=6, 每个DCATB是一个 DualCrossTransformerBlock
+            x = blk(x, y, x_size)            # DCATB: HSI↔MSI 交叉注意力 + 窗口自注意力
+                                               # x:[B,L,180] → [B,L,180]
+                                               # 奇偶层交替使用 shift_size=0 和 shift=window//2 (SWIN风格)
+        return x
+        """
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x)
             else:
-                x = blk(x, y, x_size)
+                x = blk(x, y, x_size)  # 每个 DCATB: [B, L, 180] → [B, L, 180]
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -860,6 +872,22 @@ class RSTB(nn.Module):
             norm_layer=None)
 
     def forward(self, x, y, x_size):
+        """[公式(10)] RDCTG 前向传播: F_X^{i,out} = Conv(PatchEmbed(Conv(PatchUnEmbed(residual_group(x,y))))) + x
+
+        输入:  x[B, L, C=180], y[B, L, C=180], x_size=(H,W)
+        输出: [B, L, C=180] (与输入同shape)
+
+        数据流 (从内到外):
+        ① residual_group(x, y, x_size)   BasicLayer: N=6个DCATB串联
+           x[B,L,180] → [B,L,180]
+        ② patch_unembed(x_out, x_size)   序列→图像: [B,L,180] → [B,180,H,W]
+        ③ conv(x_img)                    Conv3x3:    [B,180,H,W] → [B,180,H,W]
+        ④ patch_embed(x_conv)            图像→序列: [B,180,H,W] → [B,L,180]
+        ⑤ + x                            全局残差:   [B,L,180] + [B,L,180] = [B,L,180]
+
+        注意: ②→③→④ 的 序列→Conv→序列 转换是为了让残差连接在图像空间进行特征变换,
+              避免在序列空间直接相加导致的维度/语义不匹配问题
+        """
         return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, y, x_size), x_size))) + x
 
     def flops(self):
@@ -951,6 +979,12 @@ class PatchUnEmbed(nn.Module):
 
 
 class dualTransformer(nn.Module):
+    """[DCT 的核心融合模块] 双交叉注意力 Transformer
+
+    整体流程: 图像→Patch序列→N层DCATB(RSTB)→LayerNorm→序列→图像 → Conv → 残差相加
+
+    forward(x[B,180,8w,8h], y[B,180,W,H]) → [B,180,8w,8h]
+    """
     def __init__(self, n_feats, img_size=64, patch_size=4, depths=[6,6,6], num_heads=[6,6,6],
                  window_size=8, mlp_ratio=2, qkv_bias=True, qk_scale=None, drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, patch_norm=True, use_checkpoint=False, resi_connection='1conv',
@@ -958,19 +992,23 @@ class dualTransformer(nn.Module):
         super(dualTransformer, self).__init__()
         self.patch_norm = patch_norm
 
-        # split image into non-overlapping patches
+        # ── PatchEmbed: 图像 → 序列 (用于 Transformer 输入) ──
+        # 将 [B,C,H,W] flatten(2).transpose(1,2) → [B, H*W/patch²×patch², C]
+        # 实际上就是 reshape 为序列形式, 每个 "token" 对应一个 patch_size×patch_size 的图像块
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=n_feats, embed_dim=n_feats,
             norm_layer=norm_layer if self.patch_norm else None)
-        patches_resolution = self.patch_embed.patches_resolution
+        patches_resolution = self.patch_embed.patches_resolution  # e.g. (16, 16) 当 img_size=64, patch=4
         self.patches_resolution = patches_resolution
 
-        # merge non-overlapping patches into image
+        # ── PatchUnEmbed: 序列 → 图像 (用于 Transformer 输出还原) ──
+        # 将 [B, L, C] transpose(1,2).view(B,C,H,W) → [B, C, H, W], 是 PatchEmbed 的逆操作
         self.patch_unembed = PatchUnEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=n_feats, embed_dim=n_feats,
             norm_layer=norm_layer if self.patch_norm else None)
 
-        # build the last conv layer in deep feature extraction
+        # ── conv_after_body: 深度特征提取后的卷积层 (残差连接前) ──
+        # Conv(180→180, k=3, s=1, p=1), W/H不变, 用于在残差前做一次特征变换
         if resi_connection == '1conv':
             self.conv_after_body = nn.Conv2d(n_feats, n_feats, 3, 1, 1)
         elif resi_connection == '3conv':
@@ -981,6 +1019,8 @@ class dualTransformer(nn.Module):
                                                  nn.LeakyReLU(negative_slope=0.2, inplace=True),
                                                  nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
 
+        # ── RSTB (Residual Dual Cross Transformer Group): 核心融合单元 ──
+        # 内部包含: BasicLayer(N个DCATB串联) → Conv(残差变换) → 全局残差跳跃
         self.mlp_ratio = mlp_ratio
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         self.layers = nn.ModuleList()
@@ -993,7 +1033,7 @@ class dualTransformer(nn.Module):
                          window_size=window_size,
                          mlp_ratio=self.mlp_ratio,
                          qkv_bias=qkv_bias, qk_scale=qk_scale,
-                         drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],  # no impact on SR results
+                         drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                          norm_layer=norm_layer,
                          use_checkpoint=use_checkpoint,
                          img_size=img_size,
@@ -1001,41 +1041,51 @@ class dualTransformer(nn.Module):
                          resi_connection=resi_connection
                          )
             self.layers.append(layer)
-            
-#         self.layer = RSTB(dim=n_feats,
-#                          input_resolution=(patches_resolution[0],
-#                                            patches_resolution[1]),
-#                          depth=depths[i_layer],
-#                          num_heads=num_heads[i_layer],
-#                          window_size=window_size,
-#                          mlp_ratio=self.mlp_ratio,
-#                          qkv_bias=qkv_bias, qk_scale=qk_scale,
-#                          drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],  # no impact on SR results
-#                          norm_layer=norm_layer,
-#                          use_checkpoint=use_checkpoint,
-#                          img_size=img_size,
-#                          patch_size=patch_size,
-#                          resi_connection=resi_connection
-#                          )
-        
+
+        # ── LayerNorm: 最终输出前的归一化 ──
+        # 对序列维度做 LayerNorm, 输入输出 shape 不变: [B, L, C] → [B, L, C]
         self.norm = norm_layer(n_feats)
 
     def forward_features(self, x, y):
+        """核心特征提取流程 (不含最终残差):
+
+        输入: x[B,180,H,W], y[B,180,H,W]
+        输出: [B,180,H,W]
+
+        内部流程:
+        ① x_size = (H, W)  记录空间分辨率供 PatchUnEmbed 使用
+        ② x = patch_embed(x)   图像→序列: [B,180,H,W] → [B, L, 180], L=H*W
+        ③ y = patch_embed(y)   同样:      [B,180,H,W] → [B, L, 180]
+        ④ for layer in layers:
+             x = layer(x, y, x_size)   每层 RSTB: [B,L,180] → [B,L,180]
+        ⑤ x = norm(x)          LayerNorm: [B,L,180] → [B,L,180]
+        ⑥ x = patch_unembed(x) 序列→图像: [B,L,180] → [B,180,H,W]
+        """
         x_size = (x.shape[2], x.shape[3])
-        x = self.patch_embed(x)
-        y = self.patch_embed(y)
+        x = self.patch_embed(x)     # x:[B,180,H,W] → [B, L, 180], L=H*W/patch²×patch²=H*W
+        y = self.patch_embed(y)     # y:[B,180,H,W] → [B, L, 180] (y 仅作为引导信号传入 layer)
 
-        for i, layer in enumerate(self.layers):
-            x = layer(x, y, x_size)
+        for i, layer in enumerate(self.layers):  # 遍历所有 RSTB 层 (当前只有1层)
+            x = layer(x, y, x_size)  # RSTB: [B,L,180] → [B,L,180] (内部含全局残差)
 
-
-        x = self.norm(x)  # B L C
-        x = self.patch_unembed(x, x_size)
+        x = self.norm(x)              # LayerNorm: [B, L, 180] → [B, L, 180]
+        x = self.patch_unembed(x, x_size)  # 序列→图像: [B, L, 180] → [B, 180, H, W]
 
         return x
 
     def forward(self, x, y):
+        """完整前向传播 (含最终残差连接):
+
+        输入: x[B,180,8w,8h], y[B,180,W,H]
+        输出: [B,180,8w,8h]
+
+        流程: conv_after_body(forward_features(x,y)) + x
+        即: Conv([B,180,8w,8h]) + 原始输入x → [B,180,8w,8h]
+        """
         x = self.conv_after_body(self.forward_features(x, y)) + x
+        # forward_features: x[B,180,8w,8h] → [B,180,8w,8h]
+        # conv_after_body:   [B,180,8w,8h] → [B,180,8w,8h] (Conv3x3, same padding)
+        # + x:               残差相加, 保证梯度直通
 
         return x
 
