@@ -58,7 +58,8 @@ def window_partition(x, window_size):
     """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    # 重排为 [B, nW_h, nW_w, ws, ws, C] → 展平窗口维度 → [B*nW, ws, ws, C]
+    # [B, H//ws = 8, ws =8, W//ws = 8, ws = 8, C]
+    # 重排为 [B, nW_h, nW_w, ws, ws, C] → 展平窗口维度 → [B*nW = B * 8 * 8, ws, ws, C]
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
@@ -149,48 +150,62 @@ class CrossWindowAttention(nn.Module):
         实现流程: x→K,V ; y→Q ; Attention(Q,K,V) → 输出
 
         Args:
-            x: [nW*B, N, C] - 被检索的特征 (HSI特征)，用于 K, V
-            y: [nW*B, N, C] - 查询特征 (MSI特征)，用于 Q
-            mask: 可选注意力掩码 [nW, N, N]
+            x: [B*64, 64, 180] - 被检索的特征 (HSI特征)，用于 K, V
+            y: [B*64, 64, 180] - 查询特征 (MSI特征)，用于 Q
+            mask: 可选注意力掩码 [nW, 64, 64]
 
         Returns:
-            [nW*B, N, C] - 交叉注意力增强后的特征
+            [B*64, 64, 180] - 交叉注意力增强后的特征
         """
-        B_, N, C = x.shape
-        # x → K, V (HSI提供内容): [nW*B,N,C] → [2,nW*B,nH,N,d]
+        # x = [B*64, N=64, C=180]
+        B_, N, C = x.shape                                  # B_=B*64, N=8×8=64, C=180
+
+        # ── Step1: x → K, V (HSI提供内容/记忆) ──
         kv = self.qkv1(x).reshape(B_, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
+                                                            # Linear(180→360): [B*64,64,180] → [B*64,64,360]
+                                                            # reshape: [B*64,64,2,6,30] (2=K+V, 6头, 每头30维)
+                                                            # permute(2,0,3,1,4): [2, B*64, 6, 64, 30]
+        k, v = kv[0], kv[1]                                 # k:[B*64,6,64,30], v:[B*64,6,64,30]
 
-        # y → Q (MSI提供查询): [nW*B,N,C] → [1,nW*B,nH,N,d]
+        # ── Step2: y → Q (MSI提供查询/引导) ──
         qq = self.qkv2(y).reshape(B_, N, 1, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q = qq[0]
+                                                            # Linear(180→180): [B*64,64,180] → [B*64,64,180]
+                                                            # reshape: [B*64,64,1,6,30] (1=只有Q)
+                                                            # permute: [1, B*64, 6, 64, 30]
+        q = qq[0]                                           # q:[B*64,6,64,30]
 
-        # 缩放 + 注意力分数: Q @ K^T / sqrt(d) → [nW*B, nH, N, N]
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+        # ── Step3: 缩放 + 注意力分数 Q @ K^T / sqrt(d) ──
+        q = q * self.scale                                  # scale=1/sqrt(30)≈0.1826, 形状不变
+        attn = (q @ k.transpose(-2, -1))                    # [B*64,6,64,30] @ [B*64,6,30,64]
+                                                            # → [B*64,6,64,64] 注意力分数矩阵
 
-        # 加入相对位置编码 B (论文公式13中的+B)
+        # ── Step4: 加入相对位置编码 B ──
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # [nH, N, N]
-        attn = attn + relative_position_bias.unsqueeze(0)
+                                                            # 相对位置表查表 → [64, 64, nH=6]
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+                                                            # → [6, 64, 64]
+        attn = attn + relative_position_bias.unsqueeze(0)    # [1,6,64,64] 广播相加 → [B*64,6,64,64]
 
-        # Softmax 归一化 + Dropout
+        # ── Step5: Softmax 归一化 + Dropout ──
         if mask is not None:
             nW = mask.shape[0]
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+                                                            # 加上shifted window的mask
             attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
+            attn = self.softmax(attn)                       # [B*64,6,64,64], 每行归一化为概率分布
         else:
-            attn = self.softmax(attn)
+            attn = self.softmax(attn)                       # [B*64,6,64,64]
 
-        attn = self.attn_drop(attn)
+        attn = self.attn_drop(attn)                         # Dropout(0.0), 形状不变
 
-        # 加权求和: Attention @ V → 投影输出
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)  # [nW*B, nH, N, d] → [nW*B, N, C]
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        # ── Step6: 加权求和 Attention@V + 输出投影 ──
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)    # [B*64,6,64,64] @ [B*64,6,64,30] → [B*64,6,64,30]
+                                                            # transpose(1,2): [B*64,64,6,30]
+                                                            # reshape: [B*64,64,180]
+        x = self.proj(x)                                    # Linear(180→180): [B*64,64,180] → [B*64,64,180]
+        x = self.proj_drop(x)                               # Dropout(0.0): [B*64,64,180]
+        return x                                            # ★ [B*64, 64, 180]
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
@@ -443,10 +458,10 @@ class CrossSwinTransformerBlock(nn.Module):
             shifted_y = y                                 # [B,64,64,180]
 
         # ── Step6: 窗口划分 (将特征图切分为不重叠的局部窗口) ──
-        x_windows = window_partition(shifted_x, self.window_size)   # [B,64,64,180] → [nW*B,8,8,180]
+        x_windows = window_partition(shifted_x, self.window_size)   # [B,64,64,180] → [8 * 8 *B,8,8,180]
                                                                 # nW=(64/8)*(64/8)=64个窗口
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
-                                                                # [nW*B,64,180], 每个窗口展平为序列(8×8=64个token)
+                                                                # [nW*B = 64 * B,64,180], 每个窗口展平为序列(8×8=64个token)
 
         y_windows = window_partition(shifted_y, self.window_size)   # [B,64,64,180] → [nW*B,8,8,180]
         y_windows = y_windows.view(-1, self.window_size * self.window_size, C)
