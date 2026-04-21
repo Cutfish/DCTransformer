@@ -326,6 +326,34 @@ class CrossSwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        """
+        Args:
+            dim (int): 特征维度/通道数, 当前值=180
+                       (即 Q/K/V 每个头的维度 = dim / num_heads = 180/6 = 30)
+            input_resolution (tuple[int, int]): 输入特征图的空间分辨率, 当前值=(16, 16)
+                                               (来自 img_size(64)/patch_size(4) = 16)
+            num_heads (int): 多头注意力的头数, 当前值=6
+                             (每头 dim_head=180//6=30, 6个头并行计算不同子空间的注意力)
+            window_size (int): 窗口大小, 当前值=8
+                               (将 16×16 特征图划分为多个 8×8 的局部窗口, 在窗口内做注意力,
+                                复杂度从 O((HW)²) 降为 O(W²×H×W))
+            shift_size (int): 窗口偏移量, 当前值=0 或 4(交替)
+                              (奇数层shift=0: 规则窗口; 偶数层shift=4: 窗口偏移半个window_size,
+                               实现跨窗口信息交互, SWIN Transformer 的核心设计)
+            mlp_ratio (float): MLP 隐藏层维度倍率, 当前值=2.0
+                               (MLP隐藏层维度 = dim * mlp_ratio = 180*2 = 360,
+                                FFN结构: Linear(180→360)→GELU→Linear(360→180), 含残差连接)
+            qkv_bias (bool): Q/K/V 线性投影是否加偏置, 当前值=True
+            qk_scale (float | None): 注意力缩放因子, 当前值=None (自动用 head_dim**-0.5)
+                                     (Attention(Q,K,V) = softmax(QK^T/sqrt(d_k))V, 控制点积尺度)
+            drop (float): 全局 Dropout 率, 当前值=0.0
+            attn_drop (float): 注意力权重 Dropout 率, 当前值=0.0
+                               (在 softmax 后对 attention weights 做 dropout, 防止过拟合)
+            drop_path (float): Stochastic Depth 随机深度丢弃率, 当前值=0.1(线性递增分配到各层)
+                              (训练时随机丢弃整个 block 的输出, 正则化 + 节省推理时延)
+            act_layer: MLP 激活函数, 当前=GELU (Gaussian Error Linear Unit)
+            norm_layer: 归一化层, 当前=LayerNorm (对最后一个维度C做归一化)
+        """
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -470,6 +498,34 @@ class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        """
+        Args:
+            dim (int): 特征维度/通道数, 当前值=180
+                       (即 Q/K/V 每个头的维度 = dim / num_heads = 180/6 = 30)
+            input_resolution (tuple[int, int]): 输入特征图的空间分辨率, 当前值=(16, 16)
+                                               (来自 img_size(64)/patch_size(4) = 16)
+            num_heads (int): 多头注意力的头数, 当前值=6
+                             (每头 dim_head=180//6=30, 6个头并行计算不同子空间的注意力)
+            window_size (int): 窗口大小, 当前值=8
+                               (将 16×16 特征图划分为多个 8×8 的局部窗口, 在窗口内做注意力,
+                                复杂度从 O((HW)²) 降为 O(W²×H×W))
+            shift_size (int): 窗口偏移量, 当前值=0 或 4(交替)
+                              (奇数层shift=0: 规则窗口; 偶数层shift=4: 窗口偏移半个window_size,
+                               实现跨窗口信息交互, SWIN Transformer 的核心设计)
+            mlp_ratio (float): MLP 隐藏层维度倍率, 当前值=2.0
+                               (MLP隐藏层维度 = dim * mlp_ratio = 180*2 = 360,
+                                FFN结构: Linear(180→360)→GELU→Linear(360→180), 含残差连接)
+            qkv_bias (bool): Q/K/V 线性投影是否加偏置, 当前值=True
+            qk_scale (float | None): 注意力缩放因子, 当前值=None (自动用 head_dim**-0.5)
+                                     (Attention(Q,K,V) = softmax(QK^T/sqrt(d_k))V, 控制点积尺度)
+            drop (float): 全局 Dropout 率, 当前值=0.0
+            attn_drop (float): 注意力权重 Dropout 率, 当前值=0.0
+                               (在 softmax 后对 attention weights 做 dropout, 防止过拟合)
+            drop_path (float): Stochastic Depth 随机深度丢弃率, 当前值=0.1(线性递增分配到各层)
+                              (训练时随机丢弃整个 block 的输出, 正则化 + 节省推理时延)
+            act_layer: MLP 激活函数, 当前=GELU (Gaussian Error Linear Unit)
+            norm_layer: 归一化层, 当前=LayerNorm (对最后一个维度C做归一化)
+        """
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -654,6 +710,9 @@ class DualCrossTransformerBlock(nn.Module):
         super().__init__()
 
         # ⭐ 分支1: M-HCATB - 将 MSI 高频纹理注入 HSI (Q=y, KV=x)
+        # 当前数据集参数值:
+        #   dim=180, input_resolution=(16,16), num_heads=6,
+        #   window_size=8, shift_size=0或4(交替), mlp_ratio=2.0
         self.cross1 = CrossSwinTransformerBlock(dim=dim, input_resolution=input_resolution,
                                  num_heads=num_heads, window_size=window_size,
                                  shift_size=shift_size,
@@ -664,6 +723,9 @@ class DualCrossTransformerBlock(nn.Module):
                                  norm_layer=norm_layer)
 
         # ⭐ 分支2: H-MCATB - 将 HSI 光谱信息传递给 MSI (Q=x, KV=y)，注意Q/K/V分配相反!
+        # 参数与 cross1 完全相同 (同一 DCATB 内共享)
+        #   dim=180, input_resolution=(16,16), num_heads=6,
+        #   window_size=8, shift_size=0或4(交替), mlp_ratio=2.0
         self.cross2 = CrossSwinTransformerBlock(dim=dim, input_resolution=input_resolution,
                                                 num_heads=num_heads, window_size=window_size,
                                                 shift_size=shift_size,
@@ -674,6 +736,9 @@ class DualCrossTransformerBlock(nn.Module):
                                                 norm_layer=norm_layer)
 
         # STB: 对两个分支的融合结果做自注意力增强 (论文 Fig.2 绿色部分)
+        # 参数与上面相同 (同一 DCATB 内共享)
+        #   dim=180, input_resolution=(16,16), num_heads=6,
+        #   window_size=8, shift_size=0或4(交替), mlp_ratio=2.0
         self.swin = SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
                                                 num_heads=num_heads, window_size=window_size,
                                                 shift_size=shift_size,
@@ -751,7 +816,7 @@ class BasicLayer(nn.Module):
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                                  norm_layer=norm_layer)
-            for i in range(depth)])
+            for i in range(depth)]) # depth = 6
 
         # patch merging layer
         if downsample is not None:
@@ -762,8 +827,8 @@ class BasicLayer(nn.Module):
     def forward(self, x, y, x_size):
         """[公式(9)] BasicLayer 前向: N=6 个 DCATB 串联
 
-        输入:  x[B, L, C=180], y[B, L, C=180] (MSI引导信号, 在整个循环中不变), x_size=(H,W)
-        输出: [B, L, C=180]
+        输入:  x[B, L = 64 * 64, C=180], y[B, L = 64 * 64, C=180] (MSI引导信号, 在整个循环中不变), x_size=(H,W)
+        输出: [B, L = 64 * 64, C=180]
 
         流程:
         for i in range(6):                    # depth=6, 每个DCATB是一个 DualCrossTransformerBlock
@@ -773,10 +838,10 @@ class BasicLayer(nn.Module):
         return x
         """
         for blk in self.blocks:
-            if self.use_checkpoint:
+            if self.use_checkpoint: # False
                 x = checkpoint.checkpoint(blk, x)
             else:
-                x = blk(x, y, x_size)  # 每个 DCATB: [B, L, 180] → [B, L, 180]
+                x = blk(x, y, x_size)  # 每个 DCATB: [B, L, = 64 * 64, 180] → [B, L, 180]
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -841,6 +906,7 @@ class RSTB(nn.Module):
         self.dim = dim
         self.input_resolution = input_resolution
 
+        # [B, L, C=180] [B, L, C=180] (64, 64)
         self.residual_group = BasicLayer(dim=dim,
                                          input_resolution=input_resolution,
                                          depth=depth,
@@ -874,7 +940,7 @@ class RSTB(nn.Module):
     def forward(self, x, y, x_size):
         """[公式(10)] RDCTG 前向传播: F_X^{i,out} = Conv(PatchEmbed(Conv(PatchUnEmbed(residual_group(x,y))))) + x
 
-        输入:  x[B, L, C=180], y[B, L, C=180], x_size=(H,W)
+        输入:  x[B, L, C=180], y[B, L, C=180], x_size=(H = 64,W = 64)
         输出: [B, L, C=180] (与输入同shape)
 
         数据流 (从内到外):
@@ -888,7 +954,16 @@ class RSTB(nn.Module):
         注意: ②→③→④ 的 序列→Conv→序列 转换是为了让残差连接在图像空间进行特征变换,
               避免在序列空间直接相加导致的维度/语义不匹配问题
         """
-        return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, y, x_size), x_size))) + x
+        return self.patch_embed(
+          self.conv(
+            self.patch_unembed(
+              self.residual_group(
+                x, y, x_size
+              ), 
+              x_size
+            )
+          )
+        ) + x
 
     def flops(self):
         flops = 0
@@ -911,7 +986,7 @@ class PatchEmbed(nn.Module):
         embed_dim (int): Number of linear projection output channels. Default: 96.
         norm_layer (nn.Module, optional): Normalization layer. Default: None
     """
-
+    # img_size 64 patch_size 4 in_chans 180 embed_dim 180 norm_layer nn.Normal
     def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
         img_size = to_2tuple(img_size)
@@ -931,6 +1006,7 @@ class PatchEmbed(nn.Module):
             self.norm = None
 
     def forward(self, x):
+        # x:[B,180,H = 64,W = 64] → [B, L = 64 * 64, 180]
         x = x.flatten(2).transpose(1, 2)  # B Ph*Pw C
         if self.norm is not None:
             x = self.norm(x)
@@ -995,6 +1071,7 @@ class dualTransformer(nn.Module):
         # ── PatchEmbed: 图像 → 序列 (用于 Transformer 输入) ──
         # 将 [B,C,H,W] flatten(2).transpose(1,2) → [B, H*W/patch²×patch², C]
         # 实际上就是 reshape 为序列形式, 每个 "token" 对应一个 patch_size×patch_size 的图像块
+        # [B,180,H = 64,W = 64] → [B, L = 64 * 64, 180]
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=n_feats, embed_dim=n_feats,
             norm_layer=norm_layer if self.patch_norm else None)
@@ -1062,8 +1139,8 @@ class dualTransformer(nn.Module):
         ⑥ x = patch_unembed(x) 序列→图像: [B,L,180] → [B,180,H,W]
         """
         x_size = (x.shape[2], x.shape[3])
-        x = self.patch_embed(x)     # x:[B,180,H,W] → [B, L, 180], L=H*W/patch²×patch²=H*W
-        y = self.patch_embed(y)     # y:[B,180,H,W] → [B, L, 180] (y 仅作为引导信号传入 layer)
+        x = self.patch_embed(x)     # x:[B,180,H = 64,W = 64] → [B, L = 64 * 64, 180], L=H*W/patch²×patch²=H*W
+        y = self.patch_embed(y)     # y:[B,180,H = 64,W = 64] → [B, L = 64 * 64, 180] (y 仅作为引导信号传入 layer)
 
         for i, layer in enumerate(self.layers):  # 遍历所有 RSTB 层 (当前只有1层)
             x = layer(x, y, x_size)  # RSTB: [B,L,180] → [B,L,180] (内部含全局残差)
