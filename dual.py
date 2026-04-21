@@ -176,6 +176,7 @@ class CrossWindowAttention(nn.Module):
 
         # ── Step3: 缩放 + 注意力分数 Q @ K^T / sqrt(d) ──
         q = q * self.scale                                  # scale=1/sqrt(30)≈0.1826, 形状不变
+        # TODO 0421
         attn = (q @ k.transpose(-2, -1))                    # [B*64,6,64,30] @ [B*64,6,30,64]
                                                             # → [B*64,6,64,64] 注意力分数矩阵
 
