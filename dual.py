@@ -411,54 +411,83 @@ class CrossSwinTransformerBlock(nn.Module):
         return attn_mask
 
     def forward(self, x, y, x_size):
-        H, W = x_size
-        B, L, C = x.shape
-        # assert L == H * W, "input feature has wrong size"
+        """CrossSwinTransformerBlock 前向传播: 交叉注意力 + FFN (含残差连接)
 
-        shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
+        输入:  x[B, L=64*64=4096, C=180], y[B, L=4096, C=180], x_size=(H=64, W=64)
+        输出: [B, 4096, 180]
+        """
+        H, W = x_size                                    # H=64, W=64 (来自 headX 后的 [B,180,H,W])
+        B, L, C = x.shape                                # B=batch, L=64*64=4096, C=180
 
-        y = self.norm2(y)
-        y = y.view(B, H, W, C)
+        # ── Step1: 保存残差 ──
+        shortcut = x                                     # shortcut:[B,4096,180] 供后续跳跃连接
 
-        # cyclic shift
-        if self.shift_size > 0:
+        # ── Step2: LayerNorm 归一化 HSI 特征 (Pre-Norm) ──
+        x = self.norm1(x)                                # [B,4096,180] → [B,4096,180], 对最后一维C做LN
+
+        # ── Step3: 序列→空间 reshape, 为窗口划分做准备 ──
+        x = x.view(B, H, W, C)                           # [B,4096,180] → [B,64,64,180]
+
+        # ── Step4: LayerNorm 归一化 MSI 特征 (Pre-Norm) ──
+        y = self.norm2(y)                                # [B,4096,180] → [B,4096,180]
+        y = y.view(B, H, W, C)                           # [B,4096,180] → [B,64,64,180]
+
+        # ── Step5: 循环偏移 (SWIN 核心操作) ──
+        if self.shift_size > 0:                          # 偶数层: shift_size=4
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+                                                        # [B,64,64,180] 向上/左各偏移4格 → [B,64,64,180]
             shifted_y = torch.roll(y, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            shifted_x = x
-            shifted_y = y
+                                                        # [B,64,64,180] 同样偏移 → [B,64,64,180]
+        else:                                           # 奇数层: shift_size=0, 不偏移
+            shifted_x = x                                 # [B,64,64,180]
+            shifted_y = y                                 # [B,64,64,180]
 
-        # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+        # ── Step6: 窗口划分 (将特征图切分为不重叠的局部窗口) ──
+        x_windows = window_partition(shifted_x, self.window_size)   # [B,64,64,180] → [nW*B,8,8,180]
+                                                                # nW=(64/8)*(64/8)=64个窗口
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+                                                                # [nW*B,64,180], 每个窗口展平为序列(8×8=64个token)
 
-        y_windows = window_partition(shifted_y, self.window_size)  # nW*B, window_size, window_size, C
-        y_windows = y_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+        y_windows = window_partition(shifted_y, self.window_size)   # [B,64,64,180] → [nW*B,8,8,180]
+        y_windows = y_windows.view(-1, self.window_size * self.window_size, C)
+                                                                        # [nW*B,64,180]
 
-        # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
+        # ── Step7: 窗口内交叉注意力 (核心融合操作!) ──
         if self.input_resolution == x_size:
-            attn_windows = self.attn(x_windows, y_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+            attn_windows = self.attn(x_windows, y_windows, mask=self.attn_mask)
+                                                            # CrossWindowAttention:
+                                                            # 输入: x_win[nW*B,64,180], y_win[nW*B,64,180]
+                                                            # Q=y_win, KV=x_win (或反之, 取决于M-HCATB/H-MCATB)
+                                                            # 输出: [nW*B,64,180]
         else:
             attn_windows = self.attn(x_windows, y_windows, mask=self.calculate_mask(x_size).to(x.device))
+                                                            # 测试时尺寸可能非整数倍, 需动态计算mask
 
-        # merge windows
+        # ── Step8: 窗口合并 (还原为完整特征图) ──
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+                                                            # [nW*B,64,180] → [nW*B,8,8,180]
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+                                                            # [nW*B,8,8,180] → [B,64,64,180]
 
-        # reverse cyclic shift
+        # ── Step9: 反向循环偏移 (恢复原始空间位置) ──
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+                                                            # 向下/右各偏移4格, 抵消Step5的偏移
         else:
-            x = shifted_x
-        x = x.view(B, H * W, C)
+            x = shifted_x                                  # 无偏移则直接使用
 
-        # FFN
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm3(x)))
+        # ── Step10: 空间→序列 reshape ──
+        x = x.view(B, H * W, C)                            # [B,64,64,180] → [B,4096,180]
 
-        return x
+        # ── Step11: 第一个残差连接 (Attention 残差) ──
+        x = shortcut + self.drop_path(x)                   # [B,4096,180] + drop_path([B,4096,180]) = [B,4096,180]
+                                                            # Stochastic Depth: 以 drop_path 概率直接返回 shortcut
+
+        # ── Step12: FFN (前馈网络) + 第二个残差连接 ──
+        x = x + self.drop_path(self.mlp(self.norm3(x)))    # norm3([B,4096,180]) → mlp(Linear180→360→GELU→360→180)
+                                                            # → drop_path([B,4096,180]) + [B,4096,180] = [B,4096,180]
+
+        return x                                           # ★ [B,4096,180]
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
@@ -699,10 +728,10 @@ class DualCrossTransformerBlock(nn.Module):
     数据流: FX → M-HCA(FX,FY) + H-MCA(FX,FY) → 加和 → STB → 输出
 
     forward 输入/输出:
-        x: [B, C, H, W] - HSI 特征图
-        y: [B, C, H, W] - MSI 特征图
-        x_size: (H, W) - 空间分辨率
-        return: [B, L, C] - 融合后的特征序列
+        x: [B, L=4096, C=180] - HSI 特征序列 (L=H*W=64*64)
+        y: [B, L=4096, C=180] - MSI 特征序列
+        x_size: (H=64, W=64) - 空间分辨率
+        return: [B, L=4096, C=180] - 融合后的特征序列
     """
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,shift_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
@@ -749,11 +778,21 @@ class DualCrossTransformerBlock(nn.Module):
                                                 norm_layer=norm_layer)
 
     def forward(self, x, y, x_size):
-        """[论文公式(11)] DCATB 前向传播"""
-        dual1 = self.cross1(x, y, x_size)   # M-HCA: FY→Q, FX→KV → 纹理注入HSI
-        dual2 = self.cross2(y, x, x_size)   # H-MCA: FX→Q, FY→KV → 光谱信息传递
-        dual = dual1 + dual2                 # 论文公式(18): 两分支特征相加
-        out = self.swin(dual, x_size)       # 论文公式(19)(20): STB自注意力增强
+        """[论文公式(11)] DCATB 前向传播
+
+        输入:  x[B, L=4096, C=180], y[B, L=4096, C=180], x_size=(H=64,W=64)
+        输出: [B, 4096, 180]
+
+        数据流:
+          dual1 = cross1(x,y)   M-HCA: Q=y, KV=x → MSI纹理注入HSI → [B,4096,180]
+          dual2 = cross2(y,x)   H-MCA: Q=x, KV=y → HSI光谱传递给MSI → [B,4096,180]
+          dual  = dual1 + dual2  两分支特征相加 (公式18) → [B,4096,180]
+          out   = swin(dual)     STB自注意力增强 (公式19)(20) → [B,4096,180]
+        """
+        dual1 = self.cross1(x, y, x_size)   # M-HCA: FY→Q, FX→KV → 纹理注入HSI  → [B,4096,180]
+        dual2 = self.cross2(y, x, x_size)   # H-MCA: FX→Q, FY→KV → 光谱信息传递  → [B,4096,180]
+        dual = dual1 + dual2                 # 论文公式(18): 两分支特征相加     → [B,4096,180]
+        out = self.swin(dual, x_size)       # 论文公式(19)(20): STB自注意力增强 → [B,4096,180]
         return out
 
 
@@ -870,10 +909,10 @@ class RSTB(nn.Module):
         - PatchEmbed/UnEmbed + Conv: 实现序列↔图像转换后的残差
 
     forward 输入/输出:
-        x: [B, C, H, W] - 输入 HSI 特征图
-        y: [B, C, H, W] - MSI 特征图
-        x_size: (H, W) 空间分辨率
-        return: [B, C, H, W] - RDCTG 输出特征 (与输入同shape，通过全局残差相加)
+        x: [B, L=4096, C=180] - HSI 特征序列
+        y: [B, L=4096, C=180] - MSI 特征序列
+        x_size: (H=64, W=64) 空间分辨率
+        return: [B, L=4096, C=180] - RDCTG 输出特征 (与输入同shape，通过全局残差相加)
     """
 
     """
