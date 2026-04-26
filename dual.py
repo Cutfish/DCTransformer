@@ -272,37 +272,64 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, mask=None):
-        """
+        """WindowAttention (Self-Attention) 前向传播: Q/K/V 全部来自同一输入 x
+
         Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+            x: [nW*B, N, C] 输入特征，典型值 nW=64, B=8, N=64(=8×8), C=180
+            mask: [nW, N, N] 或 None, 移位窗口时屏蔽跨窗口区域的注意力权重
+        Returns:
+            [nW*B, N, C] 自注意力输出，形状与输入相同
         """
-        B_, N, C = x.shape
+        # ── Step1: 解构输入维度 ──
+        B_, N, C = x.shape                      # B_=64 * B(nW*B=64*8), N=64(window_tokens), C=180(dim)
+
+        # ── Step2: QKV 合并线性投影 + reshape 为多头 ──
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        # qkv(x): Linear(180→540):     [64 * B, 64, 180] → [64 * B, 64, 540]
+        # .reshape(...):               [64 * B, 64, 3, 6, 30]   (3=QKV, 6=num_heads, 30=head_dim=180/6)
+        # .permute(2,0,3,1,4):         [3, 64 * B, 6, 64, 30]   (把QKV维度提到最前)
 
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+        # ── Step3: 拆分 Q, K, V ──
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        # q: [64 * B, 6, 64, 30]  (Query, 来自输入x的查询向量)
+        # k: [64 * B, 6, 64, 30]  (Key, 来自输入x的键向量)
+        # v: [64 * B, 6, 64, 30]  (Value, 来自输入x的值向量)
 
+        # ── Step4: 计算缩放点积注意力分数 (Q · K^T / √d_k) + 相对位置偏置 ──
+        q = q * self.scale                        # [64 * B, 6, 64, 30] × √(1/30), 缩放防点积过大
+        attn = (q @ k.transpose(-2, -1))         # [64 * B,6,64,30] @ [64 * B,6,30,64] → [64 * B, 6, 64, 64]
+                                                    # 注意力分数矩阵: 每个token对其他64个token的相似度
+
+        # 相对位置编码 bias: 学习到的位置先验 (Swin Transformer 特有设计)
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
+        # relative_position_bias_table: [(2*8-1)²=225, 6] 可学习参数表
+        # 查表后 view:                     [64, 64, 6] (Wh*Ww × Wh*Ww × num_heads)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # [6, 64, 64]
+        attn = attn + relative_position_bias.unsqueeze(0)  # [64 * B,6,64,64] + [1,6,64,64] → [64 * B,6,64,64]
 
+        # ── Step5: Softmax 归一化 (+ 可选mask) ──
         if mask is not None:
-            nW = mask.shape[0]
+            # mask: [nW, 64, 64] (SW-MSA 时屏蔽不合法的跨窗口attention, -inf → softmax后≈0)
+            nW = mask.shape[0]                  # nW=64
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
+            # [8, 64, 6, 64, 64] + [1, 1, 64, 64, 64] → [8, 64, 6, 64, 64] (广播加mask)
+            attn = attn.view(-1, self.num_heads, N, N)    # [64 * B, 6, 64, 64]
+            attn = self.softmax(attn)             # [64 * B, 6, 64, 64], 每行归一化为概率分布(和=1)
         else:
-            attn = self.softmax(attn)
+            attn = self.softmax(attn)             # [64 * B, 6, 64, 64], W-MSA 无需mask, 直接softmax
 
-        attn = self.attn_drop(attn)
+        attn = self.attn_drop(attn)               # Dropout(0.0), 形状不变: [64 * B, 6, 64, 64]
 
+        # ── Step6: 加权求和 Attention@V + 输出投影 ──
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        # attn@v: [64 * B,6,64,64] @ [64 * B,6,64,30] → [64 * B,6,64,30] (加权聚合value)
+        # .transpose(1,2):      [64 * B,64,6,30]     (合并头维度到最后)
+        # .reshape(B_,N,C):     [64 * B,64,180]       (合并所有头: 6×30=180)
+
+        x = self.proj(x)                           # Linear(180→180): [64 * B, 64, 180] → [64 * B, 64, 180]
+        x = self.proj_drop(x)                      # Dropout(0.0): [64 * B, 64, 180]
+        return x                                   # ★ [64 * B, 64, 180] (= [nW*B, N, C])
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
@@ -624,46 +651,56 @@ class SwinTransformerBlock(nn.Module):
         return attn_mask
 
     def forward(self, x, x_size):
-        H, W = x_size
-        B, L, C = x.shape
-        # assert L == H * W, "input feature has wrong size"
+        # 输入: x=[B, L, C], x_size=(H, W)
+        # 典型值: B=8(batch_size), L=4096(=64*64, 序列长度), C=180(dim特征维度), H=64, W=64
+        # 注: x_size来自dualTransformer.forward_features中 x_size=(x.shape[2], x.shape[3]),
+        #     即patch_embed前的图像空间分辨率(patch_size=64), 而非patches_resolution(16,16)
+        H, W = x_size                          # H=64, W=64 (图像空间分辨率)
+        B, L, C = x.shape                      # B=8, L=4096(=H*W), C=180
 
-        shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
+        shortcut = x                            # [B, 4096, 180] ← 保存原始输入，用于后续残差连接
+        x = self.norm1(x)                       # [B, 4096, 180] ← LayerNorm对最后一维归一化，形状不变
+        x = x.view(B, H, W, C)                 # [B, 64, 64, 180] ← 从1D序列恢复为2D特征图
 
-        # cyclic shift
+        # cyclic shift (循环移位: 实现跨窗口交互 SW-MSA)
         if self.shift_size > 0:
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            # [B, 64, 64, 180] ← 沿H,W维度各偏移shift_size(如4)，形状不变，仅位置循环滚动
         else:
-            shifted_x = x
+            shifted_x = x                        # [B, 64, 64, 180] ← 不移位，规则窗口W-MSA
 
-        # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+        # partition windows (窗口分区)
+        x_windows = window_partition(shifted_x, self.window_size)  # [nW*B, 8, 8, 180]
+        # nW=(H//ws)*(W//ws)=(64//8)*(64//8)=64个窗口, 每个窗口 ws*ws=8*8
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # [nW*B, 64, 180]
+        # 将每个8x8窗口展平为64个token序列
 
-        # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
+        # W-MSA/SW-MSA (窗口自注意力 / 移位窗口自注意力)
         if self.input_resolution == x_size:
-            attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+            attn_windows = self.attn(x_windows, mask=self.attn_mask)   # [nW*B, 64, 180]
+            # WindowAttention内部: QKV投影→多头Self-Attn→输出proj, 形状保持不变
         else:
-            attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).to(x.device))
+            attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).to(x.device))  # [nW*B, 64, 180]
 
-        # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+        # merge windows (合并窗口)
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)  # [nW*B, 8, 8, 180]
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)             # [B, 64, 64, 180]
+        # window_reverse: 逆window_partition操作, 将所有窗口拼回完整特征图
 
-        # reverse cyclic shift
+        # reverse cyclic shift (反向循环移位)
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            # [B, 64, 64, 180] ← 反向滚动，还原位置
         else:
-            x = shifted_x
-        x = x.view(B, H * W, C)
+            x = shifted_x                        # [B, 64, 64, 180]
+        x = x.view(B, H * W, C)                 # [B, 4096, 180] ← 展平回1D序列形式
 
-        # FFN
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        # FFN (前馈网络 + 残差连接)
+        x = shortcut + self.drop_path(x)         # [B, 4096, 180] + [B, 4096, 180] → [B, 4096, 180]
+        # Attention分支残差: drop_path随机置零部分输出用于正则化
+        x = x + self.drop_path(self.mlp(self.norm2(x)))  # [B, 4096, 180] → norm2→mlp(180→360→180) → [B, 4096, 180] → 相加 → [B, 4096, 180]
 
-        return x
+        return x                                 # [B, 4096, 180] (输出形状与输入完全一致)
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
